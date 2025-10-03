@@ -410,14 +410,36 @@ class DebentureCalculator:
         }
     
     def export_to_html(self, cash_flow: List[Dict], emission_date: datetime,
-                      vne: float, cdi_rate: float, spread: float, filename: str = "fluxo_debenture.html"):
+                      vne: float, cdi_rate: float, spread: float, filename: str = "fluxo_debenture.html",
+                      maturity_date: datetime = None, interest_frequency: str = None,
+                      amort_type: str = None, grace_period_months: int = 0):
         """
         Exporta fluxo de caixa para HTML editável com métricas financeiras
         """
-        
+
         # Calcula métricas
         metrics = self.calculate_metrics(cash_flow, emission_date, vne, cdi_rate, spread)
-        
+
+        # Determina data de vencimento se não fornecida
+        if maturity_date is None:
+            maturity_date = cash_flow[-1]['data'] if cash_flow else emission_date
+
+        # Formata informações de input
+        freq_display = {
+            'mensal': 'Mensal',
+            'trimestral': 'Trimestral',
+            'semestral': 'Semestral',
+            'anual': 'Anual',
+            'bullet': 'Bullet (no vencimento)'
+        }
+
+        amort_display = {
+            'bullet': 'Bullet (tudo no vencimento)',
+            'sac': 'SAC (Sistema de Amortização Constante)',
+            'price': 'PRICE (Sistema Francês)',
+            'custom': 'Customizado'
+        }
+
         html = """
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -443,6 +465,44 @@ class DebentureCalculator:
             padding: 30px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .input-summary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        .input-summary h2 {
+            margin: 0 0 20px 0;
+            font-size: 1.5em;
+            border-bottom: 2px solid rgba(255,255,255,0.3);
+            padding-bottom: 10px;
+        }
+        .input-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .input-item {
+            background-color: rgba(255,255,255,0.1);
+            padding: 12px;
+            border-radius: 5px;
+            border-left: 4px solid rgba(255,255,255,0.5);
+        }
+        .input-item label {
+            display: block;
+            font-size: 0.85em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .input-item .value {
+            font-size: 1.3em;
+            font-weight: bold;
         }
         table {
             width: 100%;
@@ -534,7 +594,53 @@ class DebentureCalculator:
 <body>
     <div class="container">
         <h1>📊 Fluxo de Pagamento - Debênture CDI+</h1>
-        
+
+        <div class="input-summary">
+            <h2>📋 Dados da Debênture</h2>
+            <div class="input-grid">
+                <div class="input-item">
+                    <label>📅 Data de Emissão</label>
+                    <div class="value">""" + emission_date.strftime('%d/%m/%Y') + """</div>
+                </div>
+                <div class="input-item">
+                    <label>📅 Data de Vencimento</label>
+                    <div class="value">""" + maturity_date.strftime('%d/%m/%Y') + """</div>
+                </div>
+                <div class="input-item">
+                    <label>💰 Valor Nominal (VNE)</label>
+                    <div class="value">R$ """ + f"{vne:,.2f}" + """</div>
+                </div>
+                <div class="input-item">
+                    <label>📊 Taxa CDI Projetada</label>
+                    <div class="value">""" + f"{cdi_rate:.2f}% a.a." + """</div>
+                </div>
+                <div class="input-item">
+                    <label>➕ Spread sobre CDI</label>
+                    <div class="value">""" + f"{spread:.2f}% a.a." + """</div>
+                </div>
+                <div class="input-item">
+                    <label>📈 Taxa Total (Projetada)</label>
+                    <div class="value">""" + f"{cdi_rate + spread:.2f}% a.a." + """</div>
+                </div>
+                <div class="input-item">
+                    <label>💵 Periodicidade dos Juros</label>
+                    <div class="value">""" + (freq_display.get(interest_frequency, 'N/A') if interest_frequency else 'N/A') + """</div>
+                </div>
+                <div class="input-item">
+                    <label>📉 Sistema de Amortização</label>
+                    <div class="value">""" + (amort_display.get(amort_type, 'N/A') if amort_type else 'N/A') + """</div>
+                </div>
+                <div class="input-item">
+                    <label>⏳ Carência do Principal</label>
+                    <div class="value">""" + f"{grace_period_months} meses" + """</div>
+                </div>
+                <div class="input-item">
+                    <label>📆 Prazo Total</label>
+                    <div class="value">""" + f"{(maturity_date - emission_date).days} dias" + """</div>
+                </div>
+            </div>
+        </div>
+
         <table id="cashFlowTable">
             <thead>
                 <tr>
@@ -1087,7 +1193,9 @@ def main():
               f"R$ {total_pmt:>12,.2f}")
         
         # Exporta para HTML
-        calc.export_to_html(cash_flow, emission_date, vne, cdi_rate, spread, filename)
+        calc.export_to_html(cash_flow, emission_date, vne, cdi_rate, spread, filename,
+                           maturity_date=maturity_date, interest_frequency=interest_freq,
+                           amort_type=amort_type, grace_period_months=grace_months)
         
         print("\n" + "=" * 70)
         print("✅ CÁLCULO CONCLUÍDO COM SUCESSO!")
