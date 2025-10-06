@@ -7,6 +7,10 @@ Versão Interativa
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 import holidays
+from pyettj import get_ettj_anbima
+import pandas as pd
+import numpy as np
+import json
 
 class DebentureCalculator:
     """
@@ -16,6 +20,8 @@ class DebentureCalculator:
     def __init__(self):
         # Feriados nacionais do Brasil (ANBIMA)
         self.br_holidays = holidays.Brazil(years=range(2020, 2050))
+        # Curva DI futura (será carregada quando necessário)
+        self.di_curve = None
         
     def is_business_day(self, date: datetime) -> bool:
         """Verifica se é dia útil (exclui sábados, domingos e feriados nacionais)"""
@@ -41,6 +47,92 @@ class DebentureCalculator:
     def count_calendar_days(self, start_date: datetime, end_date: datetime) -> int:
         """Conta dias corridos entre duas datas (exclusive end_date)"""
         return (end_date - start_date).days
+
+    def load_di_curve(self, reference_date: datetime = None):
+        """
+        Carrega a curva de juros prefixada (PRE) da ANBIMA como proxy para DI
+
+        reference_date: Data de referência para a curva (default: dia útil anterior)
+        """
+        try:
+            if reference_date is None:
+                reference_date = datetime.now()
+
+            # Tenta carregar dados da ANBIMA
+            # ANBIMA atualiza dados com 1 dia de atraso
+            date_to_try = reference_date
+            max_attempts = 5
+
+            for attempt in range(max_attempts):
+                try:
+                    date_str = date_to_try.strftime('%d/%m/%Y')
+                    _, ettj, _, _ = get_ettj_anbima(date_str)
+
+                    # Remove linhas vazias e converte valores
+                    ettj = ettj.dropna(subset=['Vertice', 'Prefixados'])
+                    ettj['Vertice'] = ettj['Vertice'].str.replace('.', '').str.strip()
+                    ettj['Prefixados'] = ettj['Prefixados'].str.replace(',', '.').str.strip()
+
+                    # Remove linhas com valores vazios
+                    ettj = ettj[(ettj['Vertice'] != '') & (ettj['Prefixados'] != '')]
+
+                    ettj['Vertice'] = ettj['Vertice'].astype(int)
+                    ettj['Prefixados'] = ettj['Prefixados'].astype(float)
+
+                    self.di_curve = ettj[['Vertice', 'Prefixados']].copy()
+                    self.di_curve.columns = ['dias_uteis', 'taxa']
+
+                    print(f"[OK] Curva PRE/DI ANBIMA carregada para {date_str}")
+                    print(f"     Vertices disponiveis: {len(self.di_curve)} pontos")
+                    return True
+
+                except ValueError:
+                    # Tenta dia anterior
+                    date_to_try = date_to_try - timedelta(days=1)
+                    if attempt < max_attempts - 1:
+                        continue
+                    else:
+                        raise
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao carregar curva ANBIMA: {str(e)}")
+            print("        Continuando com taxa CDI fixa fornecida pelo usuario")
+            self.di_curve = None
+            return False
+
+    def get_cdi_rate_from_curve(self, payment_date: datetime, emission_date: datetime) -> float:
+        """
+        Obtém taxa da curva PRE para uma data específica usando interpolação linear
+
+        Retorna taxa anual em percentual (ex: 10.65 para 10,65% a.a.)
+        """
+        if self.di_curve is None:
+            return None
+
+        try:
+            # Calcula dias úteis até o pagamento
+            business_days = self.count_business_days(emission_date, payment_date)
+
+            # Interpola taxa usando os vértices da curva
+            vertices = self.di_curve['dias_uteis'].values
+            taxas = self.di_curve['taxa'].values
+
+            # Interpolação linear
+            if business_days <= vertices[0]:
+                # Se prazo menor que primeiro vértice, usa a taxa do primeiro vértice
+                rate = taxas[0]
+            elif business_days >= vertices[-1]:
+                # Se prazo maior que último vértice, usa a taxa do último vértice
+                rate = taxas[-1]
+            else:
+                # Interpolação linear entre vértices
+                rate = np.interp(business_days, vertices, taxas)
+
+            return float(rate)
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao interpolar taxa da curva: {str(e)}")
+            return None
     
     def generate_payment_dates(self, 
                               emission_date: datetime,
@@ -149,16 +241,28 @@ class DebentureCalculator:
                           vna: float,
                           cdi_rate_annual: float,
                           spread_annual: float,
-                          business_days: int) -> float:
+                          business_days: int,
+                          payment_date: datetime = None,
+                          emission_date: datetime = None) -> float:
         """
         Calcula juros do período (CDI + Spread)
-        
+
         Fórmula: J = VNA × (FatorDI × FatorSpread - 1)
+
+        Se curva DI estiver disponível e datas forem fornecidas, usa taxa da curva
         """
-        fator_di = self.calculate_cdi_factor(cdi_rate_annual, business_days)
+        # Tenta obter taxa da curva DI futura
+        curve_cdi_rate = None
+        if payment_date and emission_date:
+            curve_cdi_rate = self.get_cdi_rate_from_curve(payment_date, emission_date)
+
+        # Usa taxa da curva se disponível, senão usa a taxa fixa fornecida
+        effective_cdi_rate = curve_cdi_rate if curve_cdi_rate is not None else cdi_rate_annual
+
+        fator_di = self.calculate_cdi_factor(effective_cdi_rate, business_days)
         fator_spread = self.calculate_spread_factor(spread_annual, business_days)
         fator_juros = fator_di * fator_spread
-        
+
         return vna * (fator_juros - 1)
     
     def calculate_amortization_schedule(self,
@@ -243,9 +347,10 @@ class DebentureCalculator:
             business_days = self.count_business_days(previous_date, payment_date)
             calendar_days = self.count_calendar_days(previous_date, payment_date)
             
-            # Calcula juros
+            # Calcula juros (passa as datas para usar curva DI se disponível)
             interest = self.calculate_interest(
-                vna_current, cdi_rate_annual, spread_annual, business_days
+                vna_current, cdi_rate_annual, spread_annual, business_days,
+                payment_date=payment_date, emission_date=emission_date
             )
             
             # Calcula amortização
@@ -274,7 +379,19 @@ class DebentureCalculator:
             previous_date = payment_date
         
         return cash_flow
-    
+
+    def cash_flow_to_json(self, cash_flow: List[Dict]) -> List[Dict]:
+        """
+        Converte cash flow para formato JSON serializable
+        """
+        json_flow = []
+        for row in cash_flow:
+            json_row = row.copy()
+            # Converte datetime para string
+            json_row['data'] = row['data'].strftime('%Y-%m-%d')
+            json_flow.append(json_row)
+        return json_flow
+
     def calculate_irr(self, cash_flow: List[Dict], vne: float, emission_date: datetime) -> float:
         """
         Calcula a TIR (Taxa Interna de Retorno) usando método de Newton-Raphson
@@ -611,8 +728,8 @@ class DebentureCalculator:
                     <div class="value">R$ """ + f"{vne:,.2f}" + """</div>
                 </div>
                 <div class="input-item">
-                    <label>📊 Taxa CDI Projetada</label>
-                    <div class="value">""" + f"{cdi_rate:.2f}% a.a." + """</div>
+                    <label>📊 Taxa CDI</label>
+                    <div class="value">""" + (f"Curva PRE ANBIMA" if self.di_curve is not None else f"{cdi_rate:.2f}% a.a. (fixa)") + """</div>
                 </div>
                 <div class="input-item">
                     <label>➕ Spread sobre CDI</label>
@@ -773,7 +890,9 @@ class DebentureCalculator:
         
         <p style="margin-top: 30px; text-align: center; color: #7f8c8d; font-size: 0.9em;">
             Calculado conforme padrões B3/ANBIMA - Base 252 dias úteis<br>
-            Células em amarelo são editáveis (clique para editar)<br><br>
+            Células em amarelo são editáveis (clique para editar)<br>""" + (
+            f"<strong>Curva de Juros:</strong> Curva PRE ANBIMA (taxas interpoladas por vencimento)<br>" if self.di_curve is not None else ""
+        ) + """<br>
             <strong>📚 Glossário:</strong><br>
             <strong>TIR:</strong> Taxa que iguala o valor presente dos fluxos futuros ao investimento inicial<br>
             <strong>Payback Simples:</strong> Tempo para recuperar o investimento (sem considerar valor do dinheiro no tempo)<br>
@@ -787,7 +906,7 @@ class DebentureCalculator:
         // Torna células editáveis
         document.querySelectorAll('.editable').forEach(cell => {
             cell.addEventListener('click', function() {
-                const currentValue = this.textContent.replace('R$ ', '').replace(/\./g, '').replace(',', '.');
+                const currentValue = this.textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.');
                 const input = document.createElement('input');
                 input.type = 'text';
                 input.value = currentValue;
@@ -824,8 +943,8 @@ class DebentureCalculator:
             
             rows.forEach(row => {
                 const cells = row.querySelectorAll('td');
-                const juros = parseFloat(cells[5].textContent.replace('R$ ', '').replace(/\./g, '').replace(',', '.'));
-                const amort = parseFloat(cells[6].textContent.replace('R$ ', '').replace(/\./g, '').replace(',', '.'));
+                const juros = parseFloat(cells[5].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
+                const amort = parseFloat(cells[6].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
                 const pmt = juros + amort;
                 
                 totalJuros += juros;
@@ -961,8 +1080,8 @@ class DebentureCalculator:
         # Salva arquivo
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(html)
-        
-        print(f"\n✅ Arquivo HTML gerado: {filename}")
+
+        print(f"\n[OK] Arquivo HTML gerado: {filename}")
 
 
 def get_date_input(prompt: str) -> datetime:
@@ -1057,11 +1176,26 @@ def main():
     # 3. Taxas
     print("\n📊 REMUNERAÇÃO (CDI+)")
     print("-" * 70)
-    cdi_rate = get_float_input("Taxa CDI projetada (% a.a., ex: 10.65): ", min_value=0)
+
+    # Pergunta se quer usar curva DI futura
+    use_curve = input("Deseja usar a curva DI futura da B3? (S/n): ").strip().lower()
+
+    cdi_rate = 0  # Default
+    if use_curve == 's' or use_curve == '':
+        print("🔄 Buscando curva DI futura da B3...")
+        # A curva será carregada na calculadora depois
+        print("✅ Curva DI será utilizada nos cálculos")
+        cdi_rate = 0  # Será substituído pela curva
+    else:
+        cdi_rate = get_float_input("Taxa CDI projetada (% a.a., ex: 10.65): ", min_value=0)
+
     spread = get_float_input("Spread sobre CDI (% a.a., ex: 2.50): ", min_value=0)
-    
-    print(f"\n✅ Taxa total: CDI + {spread:.2f}% a.a.")
-    print(f"   Projeção: {cdi_rate:.2f}% + {spread:.2f}% = {cdi_rate + spread:.2f}% a.a.")
+
+    if use_curve == 's' or use_curve == '':
+        print(f"\n✅ Taxa total: Curva DI + {spread:.2f}% a.a.")
+    else:
+        print(f"\n✅ Taxa total: CDI + {spread:.2f}% a.a.")
+        print(f"   Projeção: {cdi_rate:.2f}% + {spread:.2f}% = {cdi_rate + spread:.2f}% a.a.")
     
     # 4. Frequência de juros
     print("\n💵 PAGAMENTO DE JUROS")
@@ -1120,9 +1254,15 @@ def main():
     print(f"Data de Emissão:      {emission_date.strftime('%d/%m/%Y')}")
     print(f"Data de Vencimento:   {maturity_date.strftime('%d/%m/%Y')}")
     print(f"Valor Nominal:        R$ {vne:,.2f}")
-    print(f"CDI Projetado:        {cdi_rate:.2f}% a.a.")
+    if use_curve == 's' or use_curve == '':
+        print(f"CDI:                  Curva PRE ANBIMA (variável por vencimento)")
+    else:
+        print(f"CDI Projetado:        {cdi_rate:.2f}% a.a. (fixo)")
     print(f"Spread:               +{spread:.2f}% a.a.")
-    print(f"Taxa Total:           CDI + {spread:.2f}% a.a.")
+    if use_curve == 's' or use_curve == '':
+        print(f"Taxa Total:           Curva PRE + {spread:.2f}% a.a.")
+    else:
+        print(f"Taxa Total:           CDI + {spread:.2f}% a.a. = {cdi_rate + spread:.2f}% a.a.")
     print(f"Periodicidade Juros:  {interest_freq.capitalize()}")
     print(f"Sistema Amortização:  {amort_type_display}")
     print(f"Carência Principal:   {grace_months} meses")
@@ -1138,7 +1278,11 @@ def main():
     # Cria calculadora e gera fluxo
     print("\n🔄 Calculando fluxo de caixa...")
     calc = DebentureCalculator()
-    
+
+    # Carrega curva DI se solicitado
+    if use_curve == 's' or use_curve == '':
+        calc.load_di_curve(emission_date)
+
     try:
         cash_flow = calc.generate_cash_flow(
             emission_date=emission_date,
