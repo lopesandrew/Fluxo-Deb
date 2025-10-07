@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Calculadora de Debêntures CDI+</title>
+    <title>Calculadora de DebÃªntures CDI+</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
 </head>
@@ -11,22 +11,22 @@
     <div class="container">
         <header>
             <div class="logo-container">
-                <h1>Calculadora de Debêntures CDI+</h1>
+                <h1>Calculadora de DebÃªntures CDI+</h1>
                 <p class="company-name">BCP Securities</p>
             </div>
-            <p class="subtitle">Padrão B3/ANBIMA - Base 252 dias úteis</p>
+            <p class="subtitle">PadrÃ£o B3/ANBIMA - Base 252 dias Ãºteis</p>
         </header>
 
-        <!-- Formulário -->
+        <!-- FormulÃ¡rio -->
         <div class="card" id="form-card">
-            <h2>Dados da Debênture</h2>
+            <h2>Dados da DebÃªnture</h2>
             <form id="debenture-form">
                 <!-- Datas -->
                 <div class="form-section">
-                    <h3>📅 Prazos</h3>
+                    <h3>ðŸ“… Prazos</h3>
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="emission_date">Data de Emissão *</label>
+                            <label for="emission_date">Data de EmissÃ£o *</label>
                             <input type="date" id="emission_date" name="emission_date" required>
                         </div>
                         <div class="form-group">
@@ -41,44 +41,106 @@
                     <h3>💰 Valor</h3>
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="vne">Valor Nominal de Emissão (R$) *</label>
-                            <input type="number" id="vne" name="vne" value="1000.00" step="0.01" min="0.01" required>
-                            <small>Padrão ANBIMA: R$ 1.000,00</small>
+                            <label for="vne">Valor Nominal Unitario (R$)</label>
+                            <input type="number" id="vne" name="vne" value="1000.00" step="0.01" readonly>
+                            <small>Fixado pelo padrao ANBIMA</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="quantity">Quantidade de Debentures *</label>
+                            <input type="number" id="quantity" name="quantity" value="1" min="1" step="1" required>
+                            <small>Total nominal = quantidade x R$ 1.000,00</small>
                         </div>
                     </div>
                 </div>
 
-                <!-- Remuneração -->
+<!-- RemuneraÃ§Ã£o -->
                 <div class="form-section">
-                    <h3>📊 Remuneração</h3>
+                    <h3>ðŸ“Š RemuneraÃ§Ã£o</h3>
+
+                    <!-- Seletor de Indexador -->
                     <div class="form-row">
                         <div class="form-group">
-                            <label>
-                                <input type="checkbox" id="use_curve" name="use_curve">
-                                Usar Curva DI Futura ANBIMA
-                            </label>
-                            <small>Se desmarcado, informe taxa CDI fixa abaixo</small>
+                            <label for="indexador">Indexador *</label>
+                            <select id="indexador" name="indexador" required>
+                                <option value="CDI" selected>CDI (DI+)</option>
+                                <option value="IPCA">IPCA (InflaÃ§Ã£o)</option>
+                            </select>
+                            <small>Escolha o indexador da debÃªnture</small>
                         </div>
                     </div>
-                    <div class="form-row" id="cdi-rate-row">
-                        <div class="form-group">
-                            <label for="cdi_rate">Taxa CDI Projetada (% a.a.)</label>
-                            <input type="number" id="cdi_rate" name="cdi_rate" value="10.65" step="0.01" min="0">
-                            <small>Exemplo: 10.65 para 10,65% ao ano</small>
+
+                    <!-- Campos para CDI+ -->
+                    <div id="cdi-fields">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="use_curve" name="use_curve">
+                                    Usar Curva DI Futura ANBIMA
+                                </label>
+                                <small>Se desmarcado, informe taxa CDI fixa abaixo</small>
+                            </div>
+                        </div>
+                        <div class="form-row" id="cdi-rate-row">
+                            <div class="form-group">
+                                <label for="cdi_rate">Taxa CDI Projetada (% a.a.)</label>
+                                <input type="number" id="cdi_rate" name="cdi_rate" value="10.65" step="0.01" min="0">
+                                <small>Exemplo: 10.65 para 10,65% ao ano</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="spread" id="spread-label">Spread sobre CDI (% a.a.) *</label>
+                                <input type="number" id="spread" name="spread" value="2.50" step="0.01" min="0" required>
+                                <small id="spread-hint">Exemplo: 2.50 para CDI + 2,50%</small>
+                            </div>
                         </div>
                     </div>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="spread">Spread sobre CDI (% a.a.) *</label>
-                            <input type="number" id="spread" name="spread" value="2.50" step="0.01" min="0" required>
-                            <small>Exemplo: 2.50 para CDI + 2,50%</small>
+
+                    <!-- Campos para IPCA+ -->
+                    <div id="ipca-fields" style="display: none;">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="use_ipca_curve" name="use_ipca_curve">
+                                    Usar Curva NTN-B (Juros Reais) ANBIMA
+                                </label>
+                                <small>Se desmarcado, informe taxa real fixa abaixo</small>
+                            </div>
+                        </div>
+                        <div class="form-row" id="real-rate-row">
+                            <div class="form-group">
+                                <label for="real_rate">Spread / Taxa Real (% a.a.) *</label>
+                                <input type="number" id="real_rate" name="real_rate" value="6.00" step="0.01" min="0">
+                                <small>Exemplo: 6.00 para IPCA + 6,00% a.a.</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="ipca_projected_annual">IPCA Projetado (% a.a.)</label>
+                                <input type="number" id="ipca_projected_annual" name="ipca_projected_annual" value="4.50" step="0.01" min="0">
+                                <small>Usado apenas para projetar correÃ§Ã£o do VNA</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="anniversary_day_ipca">Dia de AniversÃ¡rio IPCA</label>
+                                <input type="number" id="anniversary_day_ipca" name="anniversary_day_ipca" value="15" min="1" max="31" step="1">
+                                <small>PadrÃ£o ANBIMA: dia 15 de cada mÃªs</small>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="ipca_indices">Índices NI (opcional)</label>
+                                <textarea id="ipca_indices" name="ipca_indices" rows="4" placeholder="Ex.: 2024-01=273.198\n2024-02=273.950"></textarea>
+                                <small>Informe os índices NIk da ANBIMA (formato YYYY-MM=valor, ex.: dados do Debêntures.com.br). Um por linha.</small>
+                            </div>
                         </div>
                     </div>
                 </div>
 
                 <!-- Estrutura -->
                 <div class="form-section">
-                    <h3>🔧 Estrutura</h3>
+                    <h3>ðŸ”§ Estrutura</h3>
                     <div class="form-row">
                         <div class="form-group">
                             <label for="interest_frequency">Periodicidade dos Juros *</label>
@@ -91,30 +153,30 @@
                             </select>
                         </div>
                         <div class="form-group">
-                            <label for="amort_type">Sistema de Amortização *</label>
+                            <label for="amort_type">Sistema de AmortizaÃ§Ã£o *</label>
                             <select id="amort_type" name="amort_type" required>
                                 <option value="bullet" selected>Bullet (tudo no vencimento)</option>
-                                <option value="sac">SAC (Sistema de Amortização Constante)</option>
-                                <option value="price">PRICE (Sistema Francês)</option>
+                                <option value="sac">SAC (Sistema de AmortizaÃ§Ã£o Constante)</option>
+                                <option value="price">PRICE (Sistema FrancÃªs)</option>
                             </select>
                         </div>
                     </div>
                     <div class="form-row">
                         <div class="form-group">
-                            <label for="grace_period_months">Carência do Principal (meses)</label>
+                            <label for="grace_period_months">CarÃªncia do Principal (meses)</label>
                             <input type="number" id="grace_period_months" name="grace_period_months" value="0" min="0" step="1">
-                            <small>Período sem amortização do principal</small>
+                            <small>PerÃ­odo sem amortizaÃ§Ã£o do principal</small>
                         </div>
                     </div>
                 </div>
 
-                <!-- Botões -->
+                <!-- BotÃµes -->
                 <div class="form-actions">
                     <button type="submit" class="btn btn-primary" id="calc-btn">
-                        🧮 Calcular Fluxo
+                        ðŸ§® Calcular Fluxo
                     </button>
                     <button type="reset" class="btn btn-secondary">
-                        🔄 Limpar
+                        ðŸ”„ Limpar
                     </button>
                 </div>
             </form>
@@ -133,19 +195,19 @@
         <div id="results" style="display: none;">
             <!-- Resumo dos Inputs -->
             <div class="card">
-                <h2>📋 Dados da Operação</h2>
+                <h2>ðŸ“‹ Dados da OperaÃ§Ã£o</h2>
                 <div class="input-summary" id="input-summary"></div>
             </div>
 
-            <!-- Métricas -->
+            <!-- MÃ©tricas -->
             <div class="card">
-                <h2>📊 Métricas Financeiras</h2>
+                <h2>ðŸ“Š MÃ©tricas Financeiras</h2>
                 <div class="metrics-grid" id="metrics-grid"></div>
             </div>
 
             <!-- Fluxo de Caixa -->
             <div class="card">
-                <h2>💵 Fluxo de Pagamentos</h2>
+                <h2>ðŸ’µ Fluxo de Pagamentos</h2>
                 <div class="table-container">
                     <table id="cash-flow-table">
                         <thead>
@@ -154,9 +216,11 @@
                                 <th>Data</th>
                                 <th>DU</th>
                                 <th>DC</th>
+                                <th>Taxa CDI (%)</th>
+                                <th>VÃ©rtice (DU)</th>
                                 <th>Saldo Devedor (R$)</th>
                                 <th>Juros (R$)</th>
-                                <th>Amortização (R$)</th>
+                                <th>AmortizaÃ§Ã£o (R$)</th>
                                 <th>PMT (R$)</th>
                             </tr>
                         </thead>
@@ -166,20 +230,20 @@
                 </div>
             </div>
 
-            <!-- Gráfico -->
+            <!-- GrÃ¡fico -->
             <div class="card">
-                <h2>📈 Visualização</h2>
+                <h2>ðŸ“ˆ VisualizaÃ§Ã£o</h2>
                 <canvas id="cash-flow-chart"></canvas>
             </div>
 
-            <!-- Ações -->
+            <!-- AÃ§Ãµes -->
             <div class="card">
                 <div class="form-actions">
                     <button class="btn btn-primary" onclick="window.print()">
-                        🖨️ Imprimir
+                        ðŸ–¨ï¸ Imprimir
                     </button>
                     <button class="btn btn-secondary" onclick="location.reload()">
-                        🔙 Nova Simulação
+                        ðŸ”™ Nova SimulaÃ§Ã£o
                     </button>
                 </div>
             </div>
@@ -187,10 +251,13 @@
     </div>
 
     <footer>
-        <p><strong>BCP Securities</strong> | Calculadora de Debêntures CDI+</p>
-        <p style="font-size: 0.85em; margin-top: 5px;">Padrão B3/ANBIMA - Base 252 dias úteis</p>
+        <p><strong>BCP Securities</strong> | Calculadora de DebÃªntures CDI+</p>
+        <p style="font-size: 0.85em; margin-top: 5px;">PadrÃ£o B3/ANBIMA - Base 252 dias Ãºteis</p>
     </footer>
 
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
+
+
+

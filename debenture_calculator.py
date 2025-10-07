@@ -6,6 +6,7 @@ Versão Interativa
 
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
+import calendar
 import holidays
 from pyettj import get_ettj_anbima
 import pandas as pd
@@ -22,6 +23,12 @@ class DebentureCalculator:
         self.br_holidays = holidays.Brazil(years=range(2020, 2050))
         # Curva DI futura (será carregada quando necessário)
         self.di_curve = None
+        # Curva IPCA/IMA-B (juros reais)
+        self.ipca_curve = None
+        # Projeções de IPCA
+        self.ipca_projections = None
+        # Índices NI customizados (chave YYYY-MM -> índice)
+        self.ipca_custom_indices = {}
         
     def is_business_day(self, date: datetime) -> bool:
         """Verifica se é dia útil (exclui sábados, domingos e feriados nacionais)"""
@@ -100,14 +107,74 @@ class DebentureCalculator:
             self.di_curve = None
             return False
 
-    def get_cdi_rate_from_curve(self, payment_date: datetime, emission_date: datetime) -> float:
+    def load_ipca_curve(self, reference_date: datetime = None):
+        """
+        Carrega a curva de juros reais (NTN-B) da ANBIMA ETTJ
+
+        A coluna 'IPCA' da ETTJ contém as taxas reais das NTN-Bs negociadas no mercado.
+
+        reference_date: Data de referência para a curva (default: dia útil anterior)
+        """
+        try:
+            if reference_date is None:
+                reference_date = datetime.now()
+
+            # Tenta carregar dados da ANBIMA
+            # ANBIMA atualiza dados com 1 dia de atraso
+            date_to_try = reference_date
+            max_attempts = 5
+
+            for attempt in range(max_attempts):
+                try:
+                    date_str = date_to_try.strftime('%d/%m/%Y')
+                    _, ettj, _, _ = get_ettj_anbima(date_str)
+
+                    # Verifica se coluna IPCA existe
+                    if 'IPCA' not in ettj.columns:
+                        raise ValueError("Coluna IPCA não encontrada na curva ANBIMA")
+
+                    # Remove linhas vazias e converte valores
+                    ettj = ettj.dropna(subset=['Vertice', 'IPCA'])
+                    ettj['Vertice'] = ettj['Vertice'].str.replace('.', '').str.strip()
+                    ettj['IPCA'] = ettj['IPCA'].str.replace(',', '.').str.strip()
+
+                    # Remove linhas com valores vazios
+                    ettj = ettj[(ettj['Vertice'] != '') & (ettj['IPCA'] != '')]
+
+                    ettj['Vertice'] = ettj['Vertice'].astype(int)
+                    ettj['IPCA'] = ettj['IPCA'].astype(float)
+
+                    self.ipca_curve = ettj[['Vertice', 'IPCA']].copy()
+                    self.ipca_curve.columns = ['dias_uteis', 'taxa_real']
+
+                    print(f"[OK] Curva NTN-B (taxas reais) ANBIMA carregada para {date_str}")
+                    print(f"     Vertices disponiveis: {len(self.ipca_curve)} pontos")
+                    return True
+
+                except ValueError:
+                    # Tenta dia anterior
+                    date_to_try = date_to_try - timedelta(days=1)
+                    if attempt < max_attempts - 1:
+                        continue
+                    else:
+                        raise
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao carregar curva IPCA ANBIMA: {str(e)}")
+            print("        Continuando com taxa real fixa fornecida pelo usuario")
+            self.ipca_curve = None
+            return False
+
+    def get_cdi_rate_from_curve(self, payment_date: datetime, emission_date: datetime) -> Tuple[float, int]:
         """
         Obtém taxa da curva PRE para uma data específica usando interpolação linear
 
-        Retorna taxa anual em percentual (ex: 10.65 para 10,65% a.a.)
+        Retorna tupla (taxa, dias_uteis) onde:
+        - taxa: taxa anual em percentual (ex: 10.65 para 10,65% a.a.)
+        - dias_uteis: número de dias úteis até o pagamento
         """
         if self.di_curve is None:
-            return None
+            return None, None
 
         try:
             # Calcula dias úteis até o pagamento
@@ -128,12 +195,226 @@ class DebentureCalculator:
                 # Interpolação linear entre vértices
                 rate = np.interp(business_days, vertices, taxas)
 
-            return float(rate)
+            return float(rate), int(business_days)
 
         except Exception as e:
             print(f"[AVISO] Erro ao interpolar taxa da curva: {str(e)}")
-            return None
-    
+            return None, None
+
+    def get_real_rate_from_curve(self, payment_date: datetime, emission_date: datetime) -> Tuple[float, int]:
+        """
+        Obtém taxa real da curva NTN-B para uma data específica usando interpolação linear
+
+        Usa a coluna 'IPCA' da ETTJ ANBIMA que contém as taxas reais das NTN-Bs.
+
+        Retorna tupla (taxa_real, dias_uteis) onde:
+        - taxa_real: taxa anual real em percentual (ex: 6.50 para 6,50% a.a.)
+        - dias_uteis: número de dias úteis até o pagamento
+        """
+        if self.ipca_curve is None:
+            return None, None
+
+        try:
+            # Calcula dias úteis até o pagamento
+            business_days = self.count_business_days(emission_date, payment_date)
+
+            # Interpola taxa usando os vértices da curva
+            vertices = self.ipca_curve['dias_uteis'].values
+            taxas = self.ipca_curve['taxa_real'].values
+
+            # Interpolação linear
+            if business_days <= vertices[0]:
+                # Se prazo menor que primeiro vértice, usa a taxa do primeiro vértice
+                rate = taxas[0]
+            elif business_days >= vertices[-1]:
+                # Se prazo maior que último vértice, usa a taxa do último vértice
+                rate = taxas[-1]
+            else:
+                # Interpolação linear entre vértices
+                rate = np.interp(business_days, vertices, taxas)
+
+            return float(rate), int(business_days)
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao interpolar taxa real da curva NTN-B: {str(e)}")
+            return None, None
+
+    def get_ipca_implicit_from_curve(self, payment_date: datetime, emission_date: datetime) -> Tuple[float, int]:
+        """
+        Calcula IPCA implícito a partir da diferença entre curva PRE e NTN-B
+
+        Fórmula: IPCA_implícito = (1 + Taxa_PRE) / (1 + Taxa_Real_NTN-B) - 1
+
+        Retorna tupla (ipca_mensal_%, vertice_dias_uteis)
+        """
+        try:
+            if self.di_curve is None or self.ipca_curve is None:
+                raise ValueError("Curvas PRE e NTN-B precisam estar carregadas para calcular IPCA implícito")
+
+            # Calcula dias úteis até pagamento
+            business_days = self.count_business_days(emission_date, payment_date)
+
+            # Interpola taxa PRE
+            taxa_pre = np.interp(
+                business_days,
+                self.di_curve['dias_uteis'].values,
+                self.di_curve['taxa'].values
+            )
+
+            # Interpola taxa real NTN-B
+            taxa_real = np.interp(
+                business_days,
+                self.ipca_curve['dias_uteis'].values,
+                self.ipca_curve['taxa_real'].values
+            )
+
+            # Calcula IPCA implícito anual
+            # (1 + Taxa_PRE) = (1 + Taxa_Real) × (1 + IPCA)
+            # IPCA = (1 + Taxa_PRE) / (1 + Taxa_Real) - 1
+            ipca_implicit_annual = ((1 + taxa_pre/100) / (1 + taxa_real/100) - 1) * 100
+
+            # Converte para mensal: (1 + ipca_anual)^(1/12) - 1
+            ipca_implicit_monthly = ((1 + ipca_implicit_annual/100) ** (1/12) - 1) * 100
+
+            # Encontra vértice mais próximo
+            idx = (np.abs(self.di_curve['dias_uteis'].values - business_days)).argmin()
+            vertice_dias_uteis = int(self.di_curve['dias_uteis'].values[idx])
+
+            return ipca_implicit_monthly, vertice_dias_uteis
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao calcular IPCA implícito da curva: {str(e)}")
+            print(f"        Usando IPCA projetado manual")
+            return None, None
+
+    def load_ipca_projections(self, ipca_projected_annual: float = 4.5):
+        """
+        Carrega projeções de IPCA para os próximos meses
+
+        Por enquanto usa uma taxa fixa projetada.
+        TODO: Integrar com API ANBIMA para projeções reais
+
+        ipca_projected_annual: IPCA anual projetado (% a.a.)
+        """
+        try:
+            # Converte taxa anual para mensal: (1 + taxa_anual)^(1/12) - 1
+            ipca_monthly = ((1 + ipca_projected_annual / 100) ** (1/12) - 1) * 100
+
+            # Cria dicionário de projeções (simplificado: usa mesma projeção para todos os meses)
+            self.ipca_projections = {
+                'monthly_rate': ipca_monthly,
+                'annual_rate': ipca_projected_annual
+            }
+
+            print(f"[OK] Projecoes IPCA carregadas: {ipca_projected_annual:.2f}% a.a. ({ipca_monthly:.4f}% a.m.)")
+            return True
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao carregar projeções IPCA: {str(e)}")
+            print("        Usando IPCA projetado de 4.5% a.a.")
+            self.ipca_projections = {
+                'monthly_rate': 0.3675,  # Aproximadamente 4.5% a.a.
+                'annual_rate': 4.5
+            }
+            return False
+
+    def _normalize_month_key_str(self, key: str) -> str:
+        key = key.strip().replace('/', '-').replace(' ', '')
+        if len(key) == 6 and key.isdigit():
+            return f"{key[:4]}-{key[4:]}"
+        if len(key) == 7 and key[4] == '-':
+            return f"{key[:4]}-{key[5:].zfill(2)}"
+        parts = key.split('-')
+        if len(parts) == 2 and len(parts[0]) == 4 and parts[1].isdigit():
+            return f"{parts[0]}-{parts[1].zfill(2)}"
+        return key
+
+    def _month_key(self, date: datetime) -> str:
+        return f"{date.year:04d}-{date.month:02d}"
+
+    def _get_ipca_monthly_factor(self, prev_date: datetime, next_date: datetime, fallback_rate: float = None) -> Tuple[float, float]:
+        monthly_factor = None
+        monthly_pct = None
+
+        if getattr(self, 'ipca_custom_indices', None):
+            prev_key = self._month_key(prev_date)
+            next_key = self._month_key(next_date)
+            prev_index = self.ipca_custom_indices.get(prev_key)
+            next_index = self.ipca_custom_indices.get(next_key)
+
+            if prev_index and next_index and prev_index > 0:
+                monthly_factor = next_index / prev_index
+                monthly_pct = (monthly_factor - 1) * 100
+
+        if monthly_factor is None:
+            rate = fallback_rate if fallback_rate is not None else 0.0
+            monthly_factor = 1 + rate / 100
+            monthly_pct = rate
+
+        return monthly_factor, monthly_pct
+
+    def calculate_vna(self, base_vna: float, base_date: datetime, current_date: datetime,
+                     anniversary_day: int = 15, ipca_monthly_rate: float = None) -> Tuple[float, float]:
+        """
+        Calcula o Valor Nominal Atualizado (VNA) pelo IPCA a partir da última data base.
+
+        base_vna: valor monetário corrigido na última data de referência (após o pagamento anterior)
+        base_date: data base a partir da qual o IPCA deve ser acumulado
+        current_date: data alvo para o novo cálculo
+
+        Retorna tupla (VNA_atualizado, IPCA_acumulado_percentual_no_período)
+        """
+        try:
+            if ipca_monthly_rate is None:
+                if self.ipca_projections:
+                    ipca_monthly_rate = self.ipca_projections['monthly_rate']
+                else:
+                    ipca_monthly_rate = 0.3675  # Default: ~4.5% a.a.
+
+            if current_date <= base_date:
+                return base_vna, 0.0
+
+            vna = base_vna
+            ipca_accumulated = 0.0
+
+            def _clamp_anniversary(year: int, month: int) -> datetime:
+                last_day = calendar.monthrange(year, month)[1]
+                day = min(anniversary_day, last_day)
+                return datetime(year, month, day)
+
+            def _next_anniversary(date: datetime) -> datetime:
+                if date.day < anniversary_day:
+                    return _clamp_anniversary(date.year, date.month)
+                month = date.month + 1
+                year = date.year + (month - 1) // 12
+                month = ((month - 1) % 12) + 1
+                return _clamp_anniversary(year, month)
+
+            last_anniversary = base_date
+            next_anniversary = _next_anniversary(last_anniversary)
+
+            while next_anniversary <= current_date:
+                monthly_factor, monthly_pct = self._get_ipca_monthly_factor(last_anniversary, next_anniversary, ipca_monthly_rate)
+                vna *= monthly_factor
+                ipca_accumulated += monthly_pct
+                last_anniversary = next_anniversary
+                next_anniversary = _next_anniversary(last_anniversary)
+
+            if current_date > last_anniversary:
+                dp = self.count_business_days(last_anniversary, current_date)
+                dt = self.count_business_days(last_anniversary, next_anniversary)
+                if dt > 0 and dp > 0:
+                    monthly_factor, monthly_pct = self._get_ipca_monthly_factor(last_anniversary, next_anniversary, ipca_monthly_rate)
+                    pro_rata = dp / dt
+                    vna *= monthly_factor ** pro_rata
+                    ipca_accumulated += monthly_pct * pro_rata
+
+            return vna, ipca_accumulated
+
+        except Exception as e:
+            print(f"[AVISO] Erro ao calcular VNA: {str(e)}")
+            return base_vna, 0.0
+
     def generate_payment_dates(self, 
                               emission_date: datetime,
                               maturity_date: datetime,
@@ -243,27 +524,64 @@ class DebentureCalculator:
                           spread_annual: float,
                           business_days: int,
                           payment_date: datetime = None,
-                          emission_date: datetime = None) -> float:
+                          emission_date: datetime = None,
+                          indexador: str = 'CDI') -> Tuple[float, float, int]:
         """
-        Calcula juros do período (CDI + Spread)
+        Calcula juros do período (CDI+ ou IPCA+)
 
-        Fórmula: J = VNA × (FatorDI × FatorSpread - 1)
+        CDI+: J = VNA × (FatorDI × FatorSpread - 1)
+        IPCA+: J = VNA_atualizado × (FatorJurosReal - 1)
 
-        Se curva DI estiver disponível e datas forem fornecidas, usa taxa da curva
+        Se curva estiver disponível e datas forem fornecidas, usa taxa da curva
+
+        Parâmetros:
+        - indexador: 'CDI' ou 'IPCA'
+
+        Retorna tupla (juros, taxa_efetiva, vertice_dias_uteis) onde:
+        - juros: valor dos juros calculados
+        - taxa_efetiva: taxa CDI ou taxa real efetivamente usada no cálculo
+        - vertice_dias_uteis: dias úteis do vértice (ou None se taxa fixa)
         """
-        # Tenta obter taxa da curva DI futura
-        curve_cdi_rate = None
-        if payment_date and emission_date:
-            curve_cdi_rate = self.get_cdi_rate_from_curve(payment_date, emission_date)
+        if indexador == 'CDI':
+            # Tenta obter taxa da curva DI futura
+            curve_cdi_rate = None
+            vertice_dias_uteis = None
+            if payment_date and emission_date:
+                curve_cdi_rate, vertice_dias_uteis = self.get_cdi_rate_from_curve(payment_date, emission_date)
 
-        # Usa taxa da curva se disponível, senão usa a taxa fixa fornecida
-        effective_cdi_rate = curve_cdi_rate if curve_cdi_rate is not None else cdi_rate_annual
+            # Usa taxa da curva se disponível, senão usa a taxa fixa fornecida
+            effective_cdi_rate = curve_cdi_rate if curve_cdi_rate is not None else cdi_rate_annual
 
-        fator_di = self.calculate_cdi_factor(effective_cdi_rate, business_days)
-        fator_spread = self.calculate_spread_factor(spread_annual, business_days)
-        fator_juros = fator_di * fator_spread
+            fator_di = self.calculate_cdi_factor(effective_cdi_rate, business_days)
+            fator_spread = self.calculate_spread_factor(spread_annual, business_days)
+            fator_juros = fator_di * fator_spread
 
-        return vna * (fator_juros - 1)
+            juros = vna * (fator_juros - 1)
+
+            return juros, effective_cdi_rate, vertice_dias_uteis
+
+        elif indexador == 'IPCA':
+            # Para IPCA+, o VNA já vem atualizado pela inflação
+            # Calcula apenas juros reais sobre o VNA atualizado
+
+            # Tenta obter taxa real da curva IMA-B
+            curve_real_rate = None
+            vertice_dias_uteis = None
+            if payment_date and emission_date:
+                curve_real_rate, vertice_dias_uteis = self.get_real_rate_from_curve(payment_date, emission_date)
+
+            # Usa taxa da curva se disponível, senão usa spread_annual como taxa real fixa
+            effective_real_rate = curve_real_rate if curve_real_rate is not None else spread_annual
+
+            # Fator de juros reais: (1 + taxa_real/100)^(du/252)
+            fator_juros_real = (1 + effective_real_rate / 100) ** (business_days / 252)
+
+            juros = vna * (fator_juros_real - 1)
+
+            return juros, effective_real_rate, vertice_dias_uteis
+
+        else:
+            raise ValueError(f"Indexador inválido: {indexador}. Use 'CDI' ou 'IPCA'.")
     
     def calculate_amortization_schedule(self,
                                        vne: float,
@@ -322,62 +640,151 @@ class DebentureCalculator:
                           interest_frequency: str,
                           amort_type: str,
                           grace_period_months: int = 0,
-                          custom_amort_percentages: List[float] = None) -> List[Dict]:
+                          custom_amort_percentages: List[float] = None,
+                          indexador: str = 'CDI',
+                          anniversary_day_ipca: int = 15,
+                          ipca_projected_annual: float = 4.5,
+                          ipca_custom_indices: Dict[str, float] = None) -> List[Dict]:
         """
-        Gera fluxo de caixa completo da debênture
+        Gera fluxo de caixa completo da debênture (CDI+ ou IPCA+)
+
+        Parâmetros adicionais:
+        - indexador: 'CDI' ou 'IPCA'
+        - anniversary_day_ipca: Dia de aniversário para atualização do VNA (padrão: 15)
+        - ipca_projected_annual: IPCA projetado em % a.a. (padrão: 4.5)
+        - ipca_custom_indices: dicionário opcional {YYYY-MM: índice NI} para usar dados oficiais da ANBIMA
         """
-        
+
         # Gera datas de pagamento
         interest_dates, amort_dates = self.generate_payment_dates(
             emission_date, maturity_date, interest_frequency, grace_period_months
         )
-        
+
         # Cronograma de amortização
         amort_schedule = self.calculate_amortization_schedule(
             vne, amort_dates, amort_type, custom_amort_percentages
         )
-        
+
+        # Carrega projeções IPCA se indexador for IPCA
+        if indexador == 'IPCA' and self.ipca_projections is None:
+            self.load_ipca_projections(ipca_projected_annual)
+
+        if indexador == 'IPCA':
+            if ipca_custom_indices:
+                tmp_indices = {}
+                for key, value in ipca_custom_indices.items():
+                    try:
+                        normalized_key = self._normalize_month_key_str(str(key))
+                        tmp_indices[normalized_key] = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                self.ipca_custom_indices = tmp_indices
+            else:
+                self.ipca_custom_indices = {}
+        else:
+            self.ipca_custom_indices = {}
+
         # Constrói fluxo de caixa
         cash_flow = []
-        vna_current = vne  # Valor Nominal Atualizado
+        saldo_devedor_nominal = vne  # Saldo devedor nominal (sem atualização monetária)
+        saldo_devedor_atualizado = vne  # Saldo devedor com atualização monetária
         previous_date = emission_date
-        
+        vna_base_value = vne
+        last_ipca_reset_date = emission_date
+
         for idx, payment_date in enumerate(interest_dates):
             # Calcula dias
             business_days = self.count_business_days(previous_date, payment_date)
             calendar_days = self.count_calendar_days(previous_date, payment_date)
-            
-            # Calcula juros (passa as datas para usar curva DI se disponível)
-            interest = self.calculate_interest(
-                vna_current, cdi_rate_annual, spread_annual, business_days,
-                payment_date=payment_date, emission_date=emission_date
+
+            saldo_nominal_before = saldo_devedor_nominal
+            ipca_accumulated = 0.0
+            ipca_monthly_to_use = None
+            vna_atualizado = saldo_devedor_nominal
+
+            if indexador == 'IPCA':
+                # Se ambas curvas estiverem carregadas, usa IPCA implícito da curva
+                if self.di_curve is not None and self.ipca_curve is not None:
+                    ipca_implicit, _ = self.get_ipca_implicit_from_curve(payment_date, emission_date)
+                    if ipca_implicit is not None:
+                        ipca_monthly_to_use = ipca_implicit
+                        print(f"[INFO] Usando IPCA implícito da curva: {ipca_implicit:.4f}% a.m. para data {payment_date.strftime('%d/%m/%Y')}")
+
+                # Fallback para IPCA projetado manual
+                if ipca_monthly_to_use is None:
+                    ipca_monthly_to_use = self.ipca_projections['monthly_rate'] if self.ipca_projections else None
+
+                vna_atualizado, ipca_accumulated = self.calculate_vna(
+                    vna_base_value,
+                    last_ipca_reset_date,
+                    payment_date,
+                    anniversary_day=anniversary_day_ipca,
+                    ipca_monthly_rate=ipca_monthly_to_use
+                )
+                saldo_devedor_atualizado = vna_atualizado
+            else:
+                saldo_devedor_atualizado = saldo_devedor_nominal
+
+            # Calcula juros APENAS sobre a taxa real (não inclui atualização monetária)
+            # A atualização monetária já está embutida no saldo devedor
+            interest, taxa_efetiva, vertice_dias_uteis = self.calculate_interest(
+                saldo_devedor_atualizado, cdi_rate_annual, spread_annual, business_days,
+                payment_date=payment_date, emission_date=emission_date,
+                indexador=indexador
             )
-            
-            # Calcula amortização
+
+            # Calcula amortização sobre o saldo atualizado
             amortization = 0.0
+            amortization_nominal = 0.0
             if payment_date in amort_schedule:
                 amort_percent = amort_schedule[payment_date]
-                amortization = vne * (amort_percent / 100)
-            
+                amortization_nominal = vne * (amort_percent / 100)
+
+                if indexador == 'IPCA':
+                    if saldo_nominal_before > 0:
+                        ratio = min(1.0, amortization_nominal / saldo_nominal_before)
+                        amortization = saldo_devedor_atualizado * ratio
+                    else:
+                        amortization = 0.0
+                else:
+                    amortization = amortization_nominal
+
             # PMT = Juros + Amortização
             pmt = interest + amortization
-            
+
             # Adiciona ao fluxo
-            cash_flow.append({
+            cash_flow_item = {
                 'evento': idx + 1,
                 'data': payment_date,
                 'dias_uteis': business_days,
                 'dias_corridos': calendar_days,
-                'saldo_devedor': vna_current,
+                'saldo_devedor': saldo_devedor_atualizado,
                 'juros': interest,
                 'amortizacao': amortization,
-                'pmt': pmt
-            })
-            
-            # Atualiza saldo devedor
-            vna_current -= amortization
+                'pmt': pmt,
+                'taxa_cdi_efetiva': taxa_efetiva if indexador == 'CDI' else None,
+                'taxa_real_efetiva': taxa_efetiva if indexador == 'IPCA' else None,
+                'vertice_dias_uteis': vertice_dias_uteis,
+                'indexador': indexador
+            }
+
+            # Campos adicionais para IPCA+
+            if indexador == 'IPCA':
+                cash_flow_item['vna_atualizado'] = vna_atualizado
+                cash_flow_item['ipca_acumulado'] = ipca_accumulated
+
+            cash_flow.append(cash_flow_item)
+
+            # Atualiza saldo devedor nominal
+            saldo_devedor_nominal = max(saldo_devedor_nominal - amortization_nominal, 0.0)
+
+            if indexador == 'IPCA':
+                saldo_pos_pagamento = saldo_devedor_atualizado - amortization
+                vna_base_value = max(saldo_pos_pagamento, 0.0)
+                last_ipca_reset_date = payment_date
+
             previous_date = payment_date
-        
+
         return cash_flow
 
     def cash_flow_to_json(self, cash_flow: List[Dict]) -> List[Dict]:
@@ -765,6 +1172,8 @@ class DebentureCalculator:
                     <th>Data</th>
                     <th>Dias Úteis</th>
                     <th>Dias Corridos</th>
+                    <th>Taxa CDI (%)</th>
+                    <th>Vértice (DU)</th>
                     <th>Saldo Devedor (R$)</th>
                     <th>Juros (R$)</th>
                     <th>Amortização (R$)</th>
@@ -783,13 +1192,19 @@ class DebentureCalculator:
             total_juros += row['juros']
             total_amort += row['amortizacao']
             total_pmt += row['pmt']
-            
+
+            # Formata taxa CDI e vértice
+            taxa_cdi_display = f"{row['taxa_cdi_efetiva']:.2f}" if row['taxa_cdi_efetiva'] is not None else "-"
+            vertice_display = f"{row['vertice_dias_uteis']}" if row['vertice_dias_uteis'] is not None else "-"
+
             html += f"""
                 <tr>
                     <td>{row['evento']}</td>
                     <td>{row['data'].strftime('%d/%m/%Y')}</td>
                     <td>{row['dias_uteis']}</td>
                     <td>{row['dias_corridos']}</td>
+                    <td>{taxa_cdi_display}</td>
+                    <td>{vertice_display}</td>
                     <td>R$ {row['saldo_devedor']:,.2f}</td>
                     <td class="editable">R$ {row['juros']:,.2f}</td>
                     <td class="editable">R$ {row['amortizacao']:,.2f}</td>
@@ -800,7 +1215,7 @@ class DebentureCalculator:
         # Linha de totais
         html += f"""
                 <tr class="total-row">
-                    <td colspan="5">TOTAIS</td>
+                    <td colspan="7">TOTAIS</td>
                     <td>R$ {total_juros:,.2f}</td>
                     <td>R$ {total_amort:,.2f}</td>
                     <td><strong>R$ {total_pmt:,.2f}</strong></td>
@@ -943,15 +1358,15 @@ class DebentureCalculator:
             
             rows.forEach(row => {
                 const cells = row.querySelectorAll('td');
-                const juros = parseFloat(cells[5].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
-                const amort = parseFloat(cells[6].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
+                const juros = parseFloat(cells[7].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
+                const amort = parseFloat(cells[8].textContent.replace('R$ ', '').replace(/\\./g, '').replace(',', '.'));
                 const pmt = juros + amort;
-                
+
                 totalJuros += juros;
                 totalAmort += amort;
                 totalPmt += pmt;
-                
-                cells[7].innerHTML = '<strong>R$ ' + pmt.toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '</strong>';
+
+                cells[9].innerHTML = '<strong>R$ ' + pmt.toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + '</strong>';
             });
             
             const numPayments = rows.length;
